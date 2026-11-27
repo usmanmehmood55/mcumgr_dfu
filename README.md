@@ -47,3 +47,16 @@ image hash before requesting `reset()`. After reconnecting, verify the device
 identity and the active image hash and version before calling `confirm()`.
 The application owns package validation, device selection, reconnect policy,
 and the decision to activate or confirm a candidate.
+
+## Hardware-in-the-loop testing
+
+The Flutter HIL harness uses `universal_ble` as its BLE transport. The Dart
+package accepts any implementation of `SmpTransport`.
+[universal_ble on pub.dev](https://pub.dev/packages/universal_ble)
+
+We extended the `universal_ble` HIL/FIT setup to exercise `mcumgr_dfu` on
+nRF52840 development kits. The harness covers SMP fragmentation, failed-write
+recovery, interrupted uploads, corrupt-image rejection, MCUboot rollback, and
+confirmation that persists across reboot.
+[Original HIL/FIT setup](https://github.com/usmanmehmood55/universal_ble/tree/main/hil) ·
+[Run the DFU hardware tests](hil/README.md)
