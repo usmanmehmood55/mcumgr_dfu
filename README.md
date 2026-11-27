@@ -60,3 +60,10 @@ recovery, interrupted uploads, corrupt-image rejection, MCUboot rollback, and
 confirmation that persists across reboot.
 [Original HIL/FIT setup](https://github.com/usmanmehmood55/universal_ble/tree/main/hil) ·
 [Run the DFU hardware tests](hil/README.md)
+
+## Maintainer
+
+Usman Mehmood
+
+[usman-embedded.com](https://usman-embedded.com) ·
+[usmanmehmood55@gmail.com](mailto:usmanmehmood55@gmail.com)
