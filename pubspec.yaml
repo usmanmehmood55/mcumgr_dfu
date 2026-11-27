@@ -1,0 +1,12 @@
+name: mcumgr_dfu
+description: A Dart MCUmgr SMP client for uploading and managing MCUboot firmware with a pluggable transport.
+version: 0.1.0-dev.1
+
+environment:
+  sdk: ^3.7.2
+
+dependencies:
+  crypto: ^3.0.7
+
+dev_dependencies:
+  test: ^1.25.0
