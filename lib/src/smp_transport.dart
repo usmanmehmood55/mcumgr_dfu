@@ -1,5 +1,11 @@
 import 'dart:typed_data';
 
+/// The write size to use over Web Bluetooth, which cannot report the
+/// negotiated MTU. Measured to work on macOS Chrome against a WellSole
+/// nRF52840; 244 was unverified and dropped the link once. Native transports
+/// use the negotiated MTU minus 3.
+const webBluetoothWriteSize = 180;
+
 /// The state and identity of the underlying connection.
 class SmpConnection {
   const SmpConnection({required this.isConnected, required this.generation});

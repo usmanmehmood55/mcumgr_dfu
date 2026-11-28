@@ -338,8 +338,8 @@ class Bench {
                 }
               },
             );
-          } on StateError catch (error) {
-            if (!error.message.toString().startsWith('Firmware upload cancelled')) rethrow;
+          } on McuMgrError catch (error) {
+            if (error.kind != McuMgrErrorKind.uploadCancelled) rethrow;
           }
           final writes = link!.writes - writesAtFirst;
           final ms = clock.elapsedMilliseconds;
@@ -402,7 +402,7 @@ class Bench {
         });
         return;
       } catch (error) {
-        if (current.connected && error is! TimeoutException) rethrow;
+        if (current.connected && !(error is McuMgrError && (error.kind == McuMgrErrorKind.writeTimeout || error.kind == McuMgrErrorKind.responseTimeout))) rethrow;
         if (acknowledged > lastRecoveryOffset) {
           lastRecoveryOffset = acknowledged;
           retriesWithoutProgress = 0;

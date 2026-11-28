@@ -9,7 +9,7 @@ void main() {
     test('fails when the link drops before the command is fully written', () async {
       final device = _Device(writeSize: 4, onFragment: (device, index) => index == 1 ? device.drop() : null);
       final client = await device.client();
-      await expectLater(client.reset(), throwsStateError);
+      await expectLater(client.reset(), _fails(McuMgrErrorKind.disconnected));
       expect(device.writes, 1);
     });
 
@@ -26,6 +26,75 @@ void main() {
     });
   });
 
+  group('image state', () {
+    final hash = Uint8List.fromList(List.generate(32, (i) => i));
+    Map<String, Object?> image({bool pending = false, bool confirmed = false}) => {
+      'slot': 1,
+      'hash': hash,
+      'pending': pending,
+      'confirmed': confirmed,
+    };
+
+    test('test() succeeds when the device reports the candidate pending', () async {
+      final device =
+          _Device()
+            ..handler =
+                (device, frame) => {
+                  'images': [image(pending: true)],
+                };
+      final client = await device.client();
+      await client.test(hash);
+    });
+
+    test('test() fails when the device does not mark the candidate pending', () async {
+      final device =
+          _Device()
+            ..handler =
+                (device, frame) => {
+                  'images': [image()],
+                };
+      final client = await device.client();
+      await expectLater(client.test(hash), _fails(McuMgrErrorKind.testNotApplied));
+    });
+
+    test('test() reads the image list back when the reply leaves it out', () async {
+      final device =
+          _Device()
+            ..handler =
+                (device, frame) =>
+                    (frame.bytes[0] & 0x07) == 2
+                        ? <Object?, Object?>{}
+                        : {
+                          'images': [image(pending: true)],
+                        };
+      final client = await device.client();
+      await client.test(hash);
+      expect(device.writes, greaterThanOrEqualTo(2), reason: 'the write, then a read of the image list');
+    });
+
+    test('confirm() fails when the device does not report the image confirmed', () async {
+      final device =
+          _Device()
+            ..handler =
+                (device, frame) => {
+                  'images': [image(pending: true)],
+                };
+      final client = await device.client();
+      await expectLater(client.confirm(hash), _fails(McuMgrErrorKind.confirmNotApplied));
+    });
+
+    test('confirm() succeeds when the device reports the image confirmed', () async {
+      final device =
+          _Device()
+            ..handler =
+                (device, frame) => {
+                  'images': [image(confirmed: true)],
+                };
+      final client = await device.client();
+      await client.confirm(hash);
+    });
+  });
+
   group('connection loss', () {
     test('a disconnect during a request retires the client', () async {
       final device =
@@ -35,25 +104,28 @@ void main() {
               return null;
             };
       final client = await device.client();
-      await expectLater(client.images(), throwsStateError);
+      await expectLater(client.images(), _fails(McuMgrErrorKind.disconnected));
       final writes = device.writes;
-      await expectLater(client.images(), throwsStateError);
+      await expectLater(client.images(), _fails(McuMgrErrorKind.transportClosed));
       expect(device.writes, writes);
     });
 
     test('a timeout retires the client and disconnects the link', () async {
       final device = _Device()..handler = (device, frame) => null;
       final client = await device.client();
-      await expectLater(client.request(0, 1, 0, {}, timeout: const Duration(milliseconds: 50)), throwsA(isA<TimeoutException>()));
+      await expectLater(
+        client.request(0, 1, 0, {}, timeout: const Duration(milliseconds: 50)),
+        _fails(McuMgrErrorKind.responseTimeout),
+      );
       expect(device.disconnects, 1);
-      await expectLater(client.images(), throwsStateError);
+      await expectLater(client.images(), _fails(McuMgrErrorKind.transportClosed));
     });
 
     test('close during a write disconnects the link', () async {
       final gate = Completer<void>();
       final device = _Device(writeSize: 4, onFragment: (device, index) => index == 1 ? gate.future : null);
       final client = await device.client();
-      final pending = expectLater(client.images(), throwsStateError);
+      final pending = expectLater(client.images(), _fails(McuMgrErrorKind.transportClosed));
       await Future<void>.delayed(Duration.zero);
       await client.close();
       gate.complete();
@@ -100,7 +172,7 @@ void main() {
       );
     });
 
-    test('an image state with non-text keys is a FormatException', () async {
+    test('an image state with non-text keys is a protocol error', () async {
       final device =
           _Device()
             ..handler =
@@ -110,7 +182,21 @@ void main() {
                   ],
                 };
       final client = await device.client();
-      await expectLater(client.images(), throwsFormatException);
+      await expectLater(client.images(), _fails(McuMgrErrorKind.imageStateInvalid));
+    });
+
+    test('decodes SMP v1 codes and marks busy or timed-out ones retryable', () {
+      expect(SmpCommandError(10, null).v1Result, SmpV1Result.busy);
+      expect(SmpCommandError(10, null).retryable, isTrue);
+      expect(SmpCommandError(2, null).retryable, isFalse);
+      expect(SmpCommandError(10, 1).v1Result, isNull, reason: 'SMP v2 codes belong to their group');
+      expect(SmpCommandError(10, 1).retryable, isFalse);
+      expect(SmpCommandError(99, null).v1Result, isNull);
+      expect('${SmpCommandError(3, null)}', contains('invalidArgument'));
+    });
+
+    test('every SMP v1 result has its own code', () {
+      expect(SmpV1Result.values.map((result) => result.code).toSet(), hasLength(SmpV1Result.values.length));
     });
   });
 
@@ -151,19 +237,13 @@ void main() {
     test('stops when the device keeps acknowledging the same offset', () async {
       final device = _Device(writeSize: 244)..handler = (device, frame) => {'off': 0};
       final client = await device.client();
-      await expectLater(
-        client.upload(image, onProgress: (_) {}, cancelled: () => false),
-        throwsA(isA<StateError>().having((e) => e.message, 'message', contains('stalled'))),
-      );
+      await expectLater(client.upload(image, onProgress: (_) {}, cancelled: () => false), _fails(McuMgrErrorKind.uploadStalled));
     });
 
     test('stops when the device keeps rewinding', () async {
       final device = _Device(writeSize: 244)..handler = (device, frame) => {'off': frame.payload['off'] == 0 ? 200 : 0};
       final client = await device.client();
-      await expectLater(
-        client.upload(image, onProgress: (_) {}, cancelled: () => false),
-        throwsA(isA<StateError>().having((e) => e.message, 'message', contains('rewound'))),
-      );
+      await expectLater(client.upload(image, onProgress: (_) {}, cancelled: () => false), _fails(McuMgrErrorKind.uploadRewound));
     });
 
     test('rejects a hash mismatch', () async {
@@ -171,7 +251,7 @@ void main() {
       final client = await device.client();
       await expectLater(
         client.upload(image, onProgress: (_) {}, cancelled: () => false),
-        throwsA(isA<StateError>().having((e) => e.message, 'message', contains('mismatch'))),
+        _fails(McuMgrErrorKind.uploadHashMismatch),
       );
     });
 
@@ -182,7 +262,7 @@ void main() {
       var progress = 0.0;
       await expectLater(
         client.upload(image, onProgress: (p) => progress = p, cancelled: () => progress > 0),
-        throwsA(isA<StateError>().having((e) => e.message, 'message', startsWith('Firmware upload cancelled'))),
+        _fails(McuMgrErrorKind.uploadCancelled),
       );
       expect(progress, lessThan(1));
     });
@@ -219,7 +299,7 @@ void main() {
           requestTimeout: const Duration(milliseconds: 50),
           firstRequestTimeout: const Duration(milliseconds: 500),
         ),
-        throwsA(isA<TimeoutException>()),
+        _fails(McuMgrErrorKind.responseTimeout),
       );
     });
 
@@ -392,3 +472,5 @@ class _Target {
     return {'off': offset + data.length};
   }
 }
+
+Matcher _fails(McuMgrErrorKind kind) => throwsA(isA<McuMgrError>().having((e) => e.kind, 'kind', kind));

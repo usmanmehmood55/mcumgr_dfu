@@ -24,12 +24,15 @@ class McuMgrClient {
     if (!_retired || _notifications != null) throw StateError('SMP client must be closed before opening');
     _generation = transport.connection.generation;
     _retired = false;
-    _notifications = transport.notifications.listen(_receive, onError: (Object error) => _fail(error));
+    _notifications = transport.notifications.listen(
+      _receive,
+      onError: (Object error) => _fail(McuMgrError(McuMgrErrorKind.notificationFailed, cause: error)),
+    );
     _connection = transport.connectionUpdates.listen((connection) {
       if (!connection.isConnected || connection.generation != _generation) {
         _retired = true;
         _buffer.clear();
-        _fail(StateError('Device disconnected during firmware operation'));
+        _fail(const McuMgrError(McuMgrErrorKind.disconnected));
       }
     });
     try {
@@ -42,9 +45,9 @@ class McuMgrClient {
   }
 
   void _check() {
-    if (_retired) throw StateError('Firmware transport is closed; reconnect before retrying');
+    if (_retired) throw const McuMgrError(McuMgrErrorKind.transportClosed);
     final s = transport.connection;
-    if (!s.isConnected || s.generation != _generation) throw StateError('Firmware connection changed');
+    if (!s.isConnected || s.generation != _generation) throw const McuMgrError(McuMgrErrorKind.connectionChanged);
   }
 
   void _fail(Object error) {
@@ -58,7 +61,7 @@ class McuMgrClient {
     _buffer.addAll(value);
     if (_buffer.length > 65543) {
       _buffer.clear();
-      _fail(const FormatException('SMP response exceeds limit'));
+      _fail(const McuMgrError(McuMgrErrorKind.responseTooLarge));
       return;
     }
     while (_buffer.length >= 8) {
@@ -74,15 +77,19 @@ class McuMgrClient {
       }
       try {
         final decoded = SmpCbor.decode(frame.sublist(8));
-        if (decoded is! Map) throw const FormatException('SMP response is not a map');
-        final response = _stringMap(decoded, 'SMP response');
+        if (decoded is! Map) throw const McuMgrError(McuMgrErrorKind.responseNotMap);
+        final response = _stringMap(decoded, McuMgrErrorKind.responseKeysNotText);
         final rc = response['rc'];
         final err = response['err'];
         if (rc is num && rc != 0 || err is Map && err['rc'] != 0) {
-          throw SmpCommandError(err is Map ? err['rc'] : rc, err is Map ? err['group'] : null);
+          final code = err is Map ? err['rc'] : rc;
+          final group = err is Map ? err['group'] : null;
+          throw SmpCommandError(code is int ? code : -1, group is int ? group : null);
         }
         final p = _pending;
         if (p != null && !p.isCompleted) p.complete(response);
+      } on FormatException catch (e) {
+        _fail(McuMgrError(McuMgrErrorKind.responseMalformed, detail: e.message));
       } catch (e) {
         _fail(e);
       }
@@ -121,7 +128,7 @@ class McuMgrClient {
     _pending = pending;
     // Install an error listener immediately; disconnect can happen during writes.
     final clock = Stopwatch()..start();
-    final response = pending.future.timeout(timeout);
+    final response = pending.future.timeout(timeout, onTimeout: () => throw const McuMgrError(McuMgrErrorKind.responseTimeout));
     unawaited(response.then<void>((_) {}, onError: (Object _, StackTrace _) {}));
     var writing = true;
     try {
@@ -130,8 +137,10 @@ class McuMgrClient {
       for (var at = 0; at < bytes.length; at += chunk) {
         _check();
         final remaining = timeout - clock.elapsed;
-        if (remaining <= Duration.zero) throw TimeoutException('Firmware command timed out');
-        await transport.write(Uint8List.sublistView(bytes, at, (at + chunk).clamp(0, bytes.length))).timeout(remaining);
+        if (remaining <= Duration.zero) throw const McuMgrError(McuMgrErrorKind.writeTimeout);
+        await transport
+            .write(Uint8List.sublistView(bytes, at, (at + chunk).clamp(0, bytes.length)))
+            .timeout(remaining, onTimeout: () => throw const McuMgrError(McuMgrErrorKind.writeTimeout));
       }
       writing = false;
       final result = await response;
@@ -140,16 +149,22 @@ class McuMgrClient {
     } catch (error) {
       // Only a request that was fully written can explain the disconnect.
       if (expectDisconnect && !writing && !transport.connection.isConnected) return {};
-      if (!writing && error is! TimeoutException) rethrow;
+      if (!writing && !(error is McuMgrError && error.kind == McuMgrErrorKind.responseTimeout)) rethrow;
       // A timeout cannot cancel a native write or a partially received SMP frame.
       _retired = true;
       _buffer.clear();
-      if (transport.connection.isConnected && transport.connection.generation == _generation) {
+      final connection = transport.connection;
+      if (connection.isConnected && connection.generation == _generation) {
         try {
           await transport.disconnect();
         } catch (_) {
           // Preserve the original failure. The client remains retired.
         }
+        if (error is! McuMgrError) throw McuMgrError(McuMgrErrorKind.writeFailed, cause: error);
+      } else if (error is! McuMgrError) {
+        // A write that failed because the link went away is the disconnect,
+        // whatever error the transport raised for it.
+        throw McuMgrError(McuMgrErrorKind.disconnected, cause: error);
       }
       rethrow;
     } finally {
@@ -161,8 +176,8 @@ class McuMgrClient {
   Future<List<Map<String, Object?>>> images() async {
     final response = await request(0, 1, 0, {});
     final images = response['images'];
-    if (images is! List) throw const FormatException('Missing MCUboot image state');
-    return images.map((v) => _stringMap(v, 'MCUboot image state')).toList();
+    if (images is! List) throw const McuMgrError(McuMgrErrorKind.imageStateMissing);
+    return images.map((v) => _stringMap(v, McuMgrErrorKind.imageStateInvalid)).toList();
   }
 
   /// Uploads a signed MCUboot image to slot 1, one SMP request at a time.
@@ -186,7 +201,7 @@ class McuMgrClient {
   }) async {
     if (image.isEmpty) throw ArgumentError('Firmware image is empty');
     void checkCancelled() {
-      if (cancelled()) throw StateError('Firmware upload cancelled; the candidate remains unconfirmed');
+      if (cancelled()) throw const McuMgrError(McuMgrErrorKind.uploadCancelled);
     }
 
     checkCancelled();
@@ -237,7 +252,7 @@ class McuMgrClient {
         }
       }
       if (low == 0 || (offset == 0 && low < headerSize && low < image.length)) {
-        throw UnsupportedError('The target needs SMP reassembly at this transport write size');
+        throw const McuMgrError(McuMgrErrorKind.reassemblyRequired);
       }
 
       // Keep intermediate chunks aligned like the native reference.
@@ -245,12 +260,12 @@ class McuMgrClient {
       final response = await request(2, 1, 1, payload(size), timeout: offset == 0 ? firstRequestTimeout : requestTimeout);
       final next = response['off'];
       if (next is! int || next < 0 || next > image.length || ((offset != 0 || !includeDigest) && next > offset + size)) {
-        throw StateError('Invalid firmware upload acknowledgement');
+        throw const McuMgrError(McuMgrErrorKind.uploadBadAcknowledgement);
       }
-      if (response['match'] == false) throw StateError('Device reported a firmware upload hash mismatch');
-      if (next < offset && ++rewinds > 3) throw StateError('Firmware upload repeatedly rewound');
+      if (response['match'] == false) throw const McuMgrError(McuMgrErrorKind.uploadHashMismatch);
+      if (next < offset && ++rewinds > 3) throw const McuMgrError(McuMgrErrorKind.uploadRewound);
       if (next == offset) {
-        if (++recoveries > 3) throw StateError('Firmware upload stalled at offset $next');
+        if (++recoveries > 3) throw McuMgrError(McuMgrErrorKind.uploadStalled, detail: 'offset $next');
       } else {
         recoveries = 0;
       }
@@ -269,17 +284,49 @@ class McuMgrClient {
       return size is int && size >= 8 && size <= 65543 ? size : null;
     } on SmpCommandError catch (error) {
       // Legacy SMP peers omit the parameters command.
-      if (error.code == 8 && error.group == null) return null;
+      if (error.v1Result == SmpV1Result.notSupported) return null;
       rethrow;
     }
   }
 
+  /// Marks the image with [hash] for a test boot on the next reset, and
+  /// verifies the device reports it as pending. Throws an [McuMgrError] of kind
+  /// [McuMgrErrorKind.testNotApplied] if it doesn't: resetting then would boot the old image again.
   Future<void> test(Uint8List hash) async {
-    await request(2, 1, 0, {'hash': hash, 'confirm': false});
+    final state = await _writeImageState(hash, confirm: false);
+    final image = state.where((image) => _sameHash(image['hash'], hash)).firstOrNull;
+    if (image?['pending'] != true) {
+      throw const McuMgrError(McuMgrErrorKind.testNotApplied);
+    }
   }
 
+  /// Makes the running image with [hash] permanent, and verifies the device
+  /// reports it as confirmed. Throws an [McuMgrError] of kind
+  /// [McuMgrErrorKind.confirmNotApplied] if it doesn't: the next
+  /// reset would revert to the previous image.
   Future<void> confirm(Uint8List hash) async {
-    await request(2, 1, 0, {'hash': hash, 'confirm': true});
+    final state = await _writeImageState(hash, confirm: true);
+    final image = state.where((image) => _sameHash(image['hash'], hash)).firstOrNull;
+    if (image?['confirmed'] != true) {
+      throw const McuMgrError(McuMgrErrorKind.confirmNotApplied);
+    }
+  }
+
+  /// Writes image state. MCUboot answers with the updated image list; a peer
+  /// that leaves it out is read back with [images].
+  Future<List<Map<String, Object?>>> _writeImageState(Uint8List hash, {required bool confirm}) async {
+    final response = await request(2, 1, 0, {'hash': hash, 'confirm': confirm});
+    final images = response['images'];
+    if (images is! List) return this.images();
+    return images.map((v) => _stringMap(v, McuMgrErrorKind.imageStateInvalid)).toList();
+  }
+
+  static bool _sameHash(Object? reported, Uint8List hash) {
+    if (reported is! List<int> || reported.length != hash.length) return false;
+    for (var i = 0; i < hash.length; i++) {
+      if (reported[i] != hash[i]) return false;
+    }
+    return true;
   }
 
   Future<void> reset({Duration timeout = const Duration(seconds: 15)}) async {
@@ -293,7 +340,7 @@ class McuMgrClient {
   /// cancelled and would corrupt the next request on that link.
   Future<void> close() async {
     _retired = true;
-    _fail(StateError('Firmware transport closed'));
+    _fail(const McuMgrError(McuMgrErrorKind.closedDuringRequest));
     await _notifications?.cancel();
     await _connection?.cancel();
     _notifications = null;
@@ -305,23 +352,137 @@ class McuMgrClient {
   }
 }
 
-Map<String, Object?> _stringMap(Object? value, String what) {
-  if (value is! Map || value.keys.any((key) => key is! String)) throw FormatException('$what is not a map with text keys');
+Map<String, Object?> _stringMap(Object? value, McuMgrErrorKind invalid) {
+  if (value is! Map || value.keys.any((key) => key is! String)) throw McuMgrError(invalid);
   return Map<String, Object?>.from(value);
+}
+
+/// Every way an SMP operation can fail other than the device rejecting a
+/// command (that is [SmpCommandError]). Each failure has its own value.
+enum McuMgrErrorKind {
+  // The link.
+  transportClosed('The firmware transport is closed; reconnect before retrying'),
+  connectionChanged('The firmware connection changed'),
+  disconnected('The device disconnected during a firmware operation'),
+  closedDuringRequest('The firmware transport was closed during a request'),
+  writeFailed('The transport failed to write an SMP request'),
+  notificationFailed('The transport failed to deliver SMP notifications'),
+
+  // Timeouts. The client retires the link after either, because a late reply
+  // or a native write can't be cancelled and would corrupt the next request.
+  writeTimeout('Writing an SMP request timed out'),
+  responseTimeout('The device did not answer an SMP request in time'),
+
+  // Replies this client can't read.
+  responseTooLarge('The SMP response exceeds the size limit'),
+  responseNotMap('The SMP response is not a map'),
+  responseMalformed('The SMP response is malformed CBOR'),
+  responseKeysNotText('The SMP response has keys that are not text'),
+  imageStateMissing('The response has no MCUboot image state'),
+  imageStateInvalid('An MCUboot image state has keys that are not text'),
+
+  // Upload.
+  reassemblyRequired('The target needs SMP reassembly at this transport write size'),
+  uploadCancelled('The upload was cancelled; the candidate remains unconfirmed'),
+  uploadBadAcknowledgement('The device sent an invalid upload acknowledgement'),
+  uploadHashMismatch('The device reported an upload hash mismatch'),
+  uploadRewound('The device repeatedly rewound the upload'),
+  uploadStalled('The upload stalled'),
+
+  // Image state.
+  testNotApplied('The device did not mark the candidate for a test boot'),
+  confirmNotApplied('The device did not confirm the image');
+
+  const McuMgrErrorKind(this.description);
+
+  final String description;
+
+  /// Whether reconnecting and repeating the operation may succeed: the link
+  /// failed or timed out, rather than the device or the data being wrong.
+  bool get retryAfterReconnect => switch (this) {
+    transportClosed ||
+    connectionChanged ||
+    disconnected ||
+    closedDuringRequest ||
+    writeFailed ||
+    notificationFailed ||
+    writeTimeout ||
+    responseTimeout => true,
+    responseTooLarge ||
+    responseNotMap ||
+    responseMalformed ||
+    responseKeysNotText ||
+    imageStateMissing ||
+    imageStateInvalid ||
+    reassemblyRequired ||
+    uploadCancelled ||
+    uploadBadAcknowledgement ||
+    uploadHashMismatch ||
+    uploadRewound ||
+    uploadStalled ||
+    testNotApplied ||
+    confirmNotApplied => false,
+  };
+}
+
+/// A failed SMP operation. [kind] says which failure it was; [detail] adds
+/// what varies (such as an offset), and [cause] is the transport's own error.
+class McuMgrError implements Exception {
+  const McuMgrError(this.kind, {this.detail, this.cause});
+
+  final McuMgrErrorKind kind;
+  final String? detail;
+  final Object? cause;
+
+  String get message => detail == null ? kind.description : '${kind.description} ($detail)';
+
+  @override
+  String toString() => 'McuMgrError.${kind.name}: $message${cause == null ? '' : ' [$cause]'}';
+}
+
+/// The SMP v1 result codes. The numbers are the device's, from the wire.
+enum SmpV1Result {
+  unknown(1),
+  noMemory(2),
+  invalidArgument(3),
+  timeout(4),
+  notFound(5),
+  badState(6),
+  messageTooLarge(7),
+  notSupported(8),
+  corrupt(9),
+  busy(10),
+  accessDenied(11),
+  protocolTooOld(12),
+  protocolTooNew(13);
+
+  const SmpV1Result(this.code);
+
+  final int code;
 }
 
 /// A device's non-zero SMP result for a well-formed request.
 ///
-/// [code] is the SMP v1 `rc` or the SMP v2 `err.rc` value. [group] is the
-/// SMP v2 `err.group`, or null for SMP v1 errors. The link stays usable.
+/// [code] is the SMP v1 `rc` or the SMP v2 `err.rc` value, or -1 if the
+/// device sent something other than a number. [group] is the SMP v2
+/// `err.group`, or null for SMP v1 errors. The link stays usable.
 class SmpCommandError implements Exception {
   SmpCommandError(this.code, this.group);
 
-  final Object? code;
-  final Object? group;
+  final int code;
+  final int? group;
+
+  /// The SMP v1 result, or null for an SMP v2 code (those are specific to
+  /// their group) or a number SMP v1 doesn't define.
+  SmpV1Result? get v1Result => group != null ? null : SmpV1Result.values.where((result) => result.code == code).firstOrNull;
+
+  /// Whether the same request may succeed later: the device was busy or
+  /// timed out internally.
+  bool get retryable => v1Result == SmpV1Result.busy || v1Result == SmpV1Result.timeout;
 
   @override
-  String toString() => 'SmpCommandError: Device rejected firmware command (group $group, code $code)';
+  String toString() =>
+      'SmpCommandError: Device rejected firmware command (${group == null ? '' : 'group $group, '}code $code${v1Result == null ? '' : ' ${v1Result!.name}'})';
 }
 
 /// The CBOR subset used by MCUmgr, including Zephyr indefinite maps/lists.

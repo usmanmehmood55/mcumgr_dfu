@@ -267,11 +267,8 @@ class Bench {
           }
         },
       );
-    } on StateError catch (error) {
-      if (!interrupt ||
-          progress < .25 ||
-          progress >= 1 ||
-          !error.message.toString().startsWith('Firmware upload cancelled')) {
+    } on McuMgrError catch (error) {
+      if (!interrupt || progress < .25 || progress >= 1 || error.kind != McuMgrErrorKind.uploadCancelled) {
         rethrow;
       }
     }
@@ -380,16 +377,17 @@ class Bench {
     await expectLater(
       upload(image),
       throwsA(
-        isA<StateError>().having(
-          (error) => error.message,
-          'message',
-          'injected follower write failure',
-        ),
+        isA<McuMgrError>()
+            .having((error) => error.kind, 'kind', McuMgrErrorKind.writeFailed)
+            .having((error) => '${error.cause}', 'cause', contains('injected follower write failure')),
       ),
     );
     expect(transport!.connectedState, false);
     final writes = transport!.writes;
-    await expectLater(client.reset(), throwsStateError);
+    await expectLater(
+      client.reset(),
+      throwsA(isA<McuMgrError>().having((error) => error.kind, 'kind', McuMgrErrorKind.transportClosed)),
+    );
     expect(transport!.writes, writes);
     await detach();
     await attach();
@@ -412,7 +410,7 @@ class Bench {
         );
         return;
       } catch (error) {
-        if (transport!.connectedState && error is! TimeoutException) rethrow;
+        if (transport!.connectedState && !(error is McuMgrError && (error.kind == McuMgrErrorKind.writeTimeout || error.kind == McuMgrErrorKind.responseTimeout))) rethrow;
         if (acknowledged > lastRecoveryOffset) {
           lastRecoveryOffset = acknowledged;
           retriesWithoutProgress = 0;
