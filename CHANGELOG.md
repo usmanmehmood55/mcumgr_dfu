@@ -1,3 +1,8 @@
+## Unreleased
+
+- Limit upload request fragmentation on small-write transports to reduce SMP
+  command timeouts on slower links.
+
 ## 0.1.0-dev.2
 
 - Add maintainer contact details to the README.

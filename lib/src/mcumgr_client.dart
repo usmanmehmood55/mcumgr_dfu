@@ -179,7 +179,10 @@ class McuMgrClient {
     final writeSize = transport.maximumWriteSize;
     final minimumPacket = 8 + SmpCbor.encode({'off': 0, 'len': image.length, 'data': Uint8List(32)}).length;
     final parameters = allowFragmentation || writeSize < minimumPacket ? await _uploadParameters() : null;
-    final packetSize = parameters ?? writeSize;
+    // A peer's buffer size describes what it can hold. Bound how many
+    // sequential writes one request needs on a link with a small write size.
+    const maxUploadFragments = 24;
+    final packetSize = parameters == null ? writeSize : parameters.clamp(0, writeSize * maxUploadFragments);
     final digest = Uint8List.fromList(sha256.convert(image).bytes);
     const headerSize = 32;
     final includeDigest =
