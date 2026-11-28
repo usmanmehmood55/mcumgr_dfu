@@ -15,7 +15,7 @@ void main() {
       addTearDown(client.close);
 
       final progress = <double>[];
-      await client.upload(image, onProgress: progress.add, cancelled: () => false);
+      await client.upload(image, onProgress: progress.add, cancelled: () => false, allowFragmentation: true);
 
       expect(transport.image.takeBytes(), orderedEquals(image));
       expect(transport.requestSizes, everyElement(lessThanOrEqualTo(2475)));

@@ -243,6 +243,7 @@ class Bench {
     Uint8List bytes, {
     bool interrupt = false,
     bool resumed = false,
+    void Function(int)? acknowledged,
   }) async {
     var progress = 0.0;
     var lastLogged = -1;
@@ -251,9 +252,11 @@ class Bench {
     try {
       await client.upload(
         bytes,
+        allowFragmentation: true,
         cancelled: () => interrupt && progress >= .25,
         onProgress: (next) {
           final offset = (next * bytes.length).round();
+          acknowledged?.call(offset);
           if (progress == 0 && resumed) {
             evidence('first_recovery_ack', {'offset': offset});
           }
@@ -393,8 +396,44 @@ class Bench {
     await baseline();
   }
 
+  Future<void> uploadWithRecovery() async {
+    final elapsed = Stopwatch()..start();
+    var acknowledged = 0;
+    var lastRecoveryOffset = -1;
+    var retriesWithoutProgress = 0;
+    for (var attempt = 0; ; attempt++) {
+      try {
+        await upload(
+          image,
+          resumed: attempt > 0,
+          acknowledged: (offset) {
+            if (offset > acknowledged) acknowledged = offset;
+          },
+        );
+        return;
+      } catch (error) {
+        if (transport!.connectedState && error is! TimeoutException) rethrow;
+        if (acknowledged > lastRecoveryOffset) {
+          lastRecoveryOffset = acknowledged;
+          retriesWithoutProgress = 0;
+        } else if (++retriesWithoutProgress >= 3) {
+          rethrow;
+        }
+        if (elapsed.elapsed >= const Duration(minutes: 15)) rethrow;
+        evidence('upload_link_lost', {
+          'offset': acknowledged,
+          'attempt': attempt + 1,
+          'error': error.toString(),
+        });
+        await detach();
+        await attach();
+        await baseline();
+      }
+    }
+  }
+
   Future<void> activate({required bool confirm}) async {
-    await upload(image);
+    await uploadWithRecovery();
     await baseline();
     await select(imageHash);
     await reboot();

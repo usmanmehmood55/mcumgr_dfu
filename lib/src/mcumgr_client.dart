@@ -75,11 +75,11 @@ class McuMgrClient {
       try {
         final decoded = SmpCbor.decode(frame.sublist(8));
         if (decoded is! Map) throw const FormatException('SMP response is not a map');
-        final response = Map<String, Object?>.from(decoded);
+        final response = _stringMap(decoded, 'SMP response');
         final rc = response['rc'];
         final err = response['err'];
         if (rc is num && rc != 0 || err is Map && err['rc'] != 0) {
-          throw _SmpCommandError(err is Map ? err['rc'] : rc, err is Map ? err['group'] : null);
+          throw SmpCommandError(err is Map ? err['rc'] : rc, err is Map ? err['group'] : null);
         }
         final p = _pending;
         if (p != null && !p.isCompleted) p.complete(response);
@@ -138,7 +138,8 @@ class McuMgrClient {
       if (!expectDisconnect) _check();
       return result;
     } catch (error) {
-      if (expectDisconnect && !transport.connection.isConnected) return {};
+      // Only a request that was fully written can explain the disconnect.
+      if (expectDisconnect && !writing && !transport.connection.isConnected) return {};
       if (!writing && error is! TimeoutException) rethrow;
       // A timeout cannot cancel a native write or a partially received SMP frame.
       _retired = true;
@@ -161,14 +162,27 @@ class McuMgrClient {
     final response = await request(0, 1, 0, {});
     final images = response['images'];
     if (images is! List) throw const FormatException('Missing MCUboot image state');
-    return images.map((v) => Map<String, Object?>.from(v as Map)).toList();
+    return images.map((v) => _stringMap(v, 'MCUboot image state')).toList();
   }
 
+  /// Uploads a signed MCUboot image to slot 1, one SMP request at a time.
+  ///
+  /// By default each request fits in one transport write. Set
+  /// [allowFragmentation] only for targets known to support SMP receive
+  /// reassembly; requests then follow the device's reported buffer size,
+  /// split across at most 24 writes. A link whose write size cannot fit the
+  /// first upload packet always requires reassembly.
+  ///
+  /// Each request waits up to [requestTimeout] for its acknowledgement. A
+  /// request at offset 0 starts a new upload, and the device may erase the
+  /// whole secondary slot before answering, so it gets [firstRequestTimeout].
   Future<void> upload(
     Uint8List image, {
     required void Function(double) onProgress,
     required bool Function() cancelled,
-    bool allowFragmentation = true,
+    bool allowFragmentation = false,
+    Duration requestTimeout = const Duration(seconds: 15),
+    Duration firstRequestTimeout = const Duration(seconds: 60),
   }) async {
     if (image.isEmpty) throw ArgumentError('Firmware image is empty');
     void checkCancelled() {
@@ -222,13 +236,13 @@ class McuMgrClient {
           high = mid - 1;
         }
       }
-      if (low == 0 || (offset == 0 && low < headerSize)) {
+      if (low == 0 || (offset == 0 && low < headerSize && low < image.length)) {
         throw UnsupportedError('The target needs SMP reassembly at this transport write size');
       }
 
       // Keep intermediate chunks aligned like the native reference.
       final size = offset + low < image.length && low >= 8 ? low - low % 8 : low;
-      final response = await request(2, 1, 1, payload(size));
+      final response = await request(2, 1, 1, payload(size), timeout: offset == 0 ? firstRequestTimeout : requestTimeout);
       final next = response['off'];
       if (next is! int || next < 0 || next > image.length || ((offset != 0 || !includeDigest) && next > offset + size)) {
         throw StateError('Invalid firmware upload acknowledgement');
@@ -253,7 +267,7 @@ class McuMgrClient {
       final response = await request(0, 0, 6, {});
       final size = response['buf_size'];
       return size is int && size >= 8 && size <= 65543 ? size : null;
-    } on _SmpCommandError catch (error) {
+    } on SmpCommandError catch (error) {
       // Legacy SMP peers omit the parameters command.
       if (error.code == 8 && error.group == null) return null;
       rethrow;
@@ -272,6 +286,11 @@ class McuMgrClient {
     await request(2, 0, 5, {}, expectDisconnect: true, timeout: timeout);
   }
 
+  /// Stops listening and releases SMP resources on the current connection.
+  ///
+  /// A request in flight fails. If it is still writing, the client also calls
+  /// [SmpTransport.disconnect], because a partly written SMP frame cannot be
+  /// cancelled and would corrupt the next request on that link.
   Future<void> close() async {
     _retired = true;
     _fail(StateError('Firmware transport closed'));
@@ -286,11 +305,23 @@ class McuMgrClient {
   }
 }
 
-class _SmpCommandError extends StateError {
-  _SmpCommandError(this.code, this.group) : super('Device rejected firmware command (group $group, code $code)');
+Map<String, Object?> _stringMap(Object? value, String what) {
+  if (value is! Map || value.keys.any((key) => key is! String)) throw FormatException('$what is not a map with text keys');
+  return Map<String, Object?>.from(value);
+}
+
+/// A device's non-zero SMP result for a well-formed request.
+///
+/// [code] is the SMP v1 `rc` or the SMP v2 `err.rc` value. [group] is the
+/// SMP v2 `err.group`, or null for SMP v1 errors. The link stays usable.
+class SmpCommandError implements Exception {
+  SmpCommandError(this.code, this.group);
 
   final Object? code;
   final Object? group;
+
+  @override
+  String toString() => 'SmpCommandError: Device rejected firmware command (group $group, code $code)';
 }
 
 /// The CBOR subset used by MCUmgr, including Zephyr indefinite maps/lists.
@@ -305,8 +336,15 @@ class SmpCbor {
         out.addAll([(major << 5) | 24, n]);
       } else if (n <= 65535) {
         out.addAll([(major << 5) | 25, n >> 8, n & 255]);
-      } else {
+      } else if (n <= 0xFFFFFFFF) {
         out.addAll([(major << 5) | 26, (n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255]);
+      } else {
+        // Split before shifting: on the web, shifts truncate to 32 bits.
+        final high = n ~/ 0x100000000, low = n % 0x100000000;
+        out.addAll([(major << 5) | 27]);
+        for (final word in [high, low]) {
+          out.addAll([(word >> 24) & 255, (word >> 16) & 255, (word >> 8) & 255, word & 255]);
+        }
       }
     }
 

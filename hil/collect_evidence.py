@@ -8,6 +8,7 @@ from pathlib import Path
 EXPECTED_REBOOTS = {
     "corrupt": 1, "interrupted": 1, "fragmented_echo": 0,
     "fragment_failure": 0, "rollback": 2, "success": 2,
+    "probe": 0, "upload": 0, "reconnect": 1,
 }
 
 

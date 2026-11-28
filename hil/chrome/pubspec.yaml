@@ -1,0 +1,18 @@
+name: mcumgr_chrome_hil
+description: Chrome Web Bluetooth hardware verification for mcumgr_dfu.
+publish_to: none
+environment:
+  sdk: ^3.7.2
+dependencies:
+  flutter:
+    sdk: flutter
+  crypto: ^3.0.7
+  http: ^1.4.0
+  mcumgr_dfu:
+    path: ../..
+  universal_ble: ^3.4.1
+dependency_overrides:
+  universal_ble:
+    path: ../../../universal_ble
+dev_dependencies:
+  flutter_lints: ^6.0.0

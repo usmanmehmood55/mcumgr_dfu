@@ -28,6 +28,12 @@ Bluetooth access when macOS prompts. The optional final argument selects
 A full run keeps the candidate installed and confirmed on success, so restore
 the baseline before repeating it.
 
+The rollback and success scenarios can reconnect during the first 15 minutes
+of an upload. Recovery stops after three consecutive link losses without new
+acknowledged bytes. Each reconnect verifies the DUT identity and confirmed
+baseline and retries the same signed image. The first acknowledgement shows
+whether the DUT retained the upload or restarted it.
+
 Keep the logs and `result.json`. The runner correlates each requested reset
 with a remote BLE disconnect and a boot epoch from the independent UART log.
 The event log contains image hashes, versions, confirmation flags, and acknowledged offsets. A transport timeout
@@ -49,3 +55,23 @@ The relay runner checks corrupt-image refusal, interrupted upload recovery,
 test activation, rollback, probation, confirmation, and persistence using
 single-write-sized SMP requests. Set `HIL_RELAY_CASE=corrupt` to run just the
 corruption case, or `HIL_RELAY_CASE=valid` for interruption, rollback, and confirmation.
+
+## Chrome Web Bluetooth
+
+`chrome/` is a Flutter web harness that runs the same lifecycle over Web
+Bluetooth. Build it, then serve it with the candidate:
+
+```sh
+(cd chrome && flutter build web --release --no-web-resources-cdn)
+python3 tool/serve_harness.py 8767 /path/to/report/events.jsonl /path/to/candidate.json
+```
+
+Open `http://127.0.0.1:8767/?case=CASE&side=left&factory=FACTORY_ID` in Google
+Chrome and click **Start / pick device**. Each evidence line is appended to the
+events file in the same schema as the macOS runner. `case` is `success`,
+`rollback`, `upload` or `probe`. `probe` uploads 32 KB per combination of
+`write` sizes and `pipeline` depths (comma lists) and cancels, which leaves the
+active image unchanged. Writes default to 180 bytes. Chrome rejects overlapping
+GATT writes, so keep `pipeline=1` outside probes. When Chrome cannot reconnect
+after a reboot or link loss, the page logs `pick_required`; click the button
+again to re-select the DK.
